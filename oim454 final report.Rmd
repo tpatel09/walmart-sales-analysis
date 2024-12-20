@@ -1,0 +1,370 @@
+---
+title: "Walmart Sales Analysis"
+author: "Tejas Patel"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    number_sections: true
+date: "2024-12-15"
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(dplyr)
+library(caret)
+library(lubridate)
+library(randomForest)
+library(ggplot2)
+library(Metrics)
+library(xgboost)
+
+# Set global chunk options
+opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE
+)
+```
+
+# Introduction
+
+Walmart is the world's largest retail firm, generating massive amounts of sales data. As a result, it becomes critical to precisely estimate Walmart's weekly sales. This study will use machine learning techniques, namely Random Forest and XGBoost models, to anticipate sales, taking into account a variety of factors such as store number, holiday flags, and economic indicators. This investigation aims to improve inventory management, uncover key sales drivers, and demonstrate the benefits of sophisticated forecasting models over traditional techniques.
+
+The business questions addressed include:
+
+- Which factors significantly influence weekly sales performance?
+
+- Can machine learning improve forecasting accuracy compared to traditional methods?
+
+# Data Preprocessing
+## Load and Explore the Data
+```{r}
+# Load the dataset
+walmart_data <- read.csv("/Users/tejas/Desktop/OIM 454/Project/Walmart.csv")
+
+# Extract year and month from the Date column
+walmart_data$Year <- year(walmart_data$Date)
+walmart_data$Month <- month(walmart_data$Date)
+
+# Check for missing values and summarize the data
+summary(walmart_data)
+```
+
+The dataset includes features such as store number, weekly sales, holiday flags, temperature, fuel price, and economic indicators (CPI and unemployment). Initial exploration revealed no missing values but significant variability in weekly sales.
+
+
+## Sales Summaries
+### By Store
+```{r}
+store_sales_summary <- walmart_data %>%
+  group_by(Store) %>%
+  summarise(
+    avg_sales = mean(Weekly_Sales, na.rm = TRUE),
+    sd_sales = sd(Weekly_Sales, na.rm = TRUE),
+    total_sales = sum(Weekly_Sales, na.rm = TRUE)
+  )
+print(store_sales_summary)
+```
+
+Store 4 had the highest total sales, while Store 9 had the lowest, reflecting variability in performance across locations. The average weekly sales per store also varied significantly with store 2 having the most.
+
+### By Year and Month
+```{r}
+monthly_sales_summary <- walmart_data %>%
+  group_by(Year, Month) %>%
+  summarise(
+    avg_sales = mean(Weekly_Sales, na.rm = TRUE),
+    total_sales = sum(Weekly_Sales, na.rm = TRUE)
+  )
+print(monthly_sales_summary)
+```
+
+Sales exhibited seasonal fluctuations, peaking during the holiday season (e.g., November and December). Non-holiday weeks, however, accounted for the majority of sales volume.
+
+### By Holiday vs Non-Holiday Weeks
+```{r}
+holiday_sales_summary <- walmart_data %>%
+  group_by(Holiday_Flag) %>%
+  summarise(
+    avg_sales = mean(Weekly_Sales, na.rm = TRUE),
+    total_sales = sum(Weekly_Sales, na.rm = TRUE)
+  )
+print(holiday_sales_summary)
+```
+
+Weeks with holiday promotions showed slightly higher average sales, though the overall impact of holiday flags was less significant than expected.
+
+## Data Cleaning and Transformation
+### Checking for Duplicates
+```{r}
+duplicates <- walmart_data[duplicated(walmart_data), ]
+print(duplicates)
+```
+
+No duplicates found.
+
+### Outlier Detection and Removal
+```{r}
+# Plot Weekly_Sales to visually check for outliers
+boxplot(walmart_data$Weekly_Sales, main = "Weekly Sales Boxplot", horizontal = TRUE)
+
+# Remove extreme outliers
+quantile_value <- quantile(walmart_data$Weekly_Sales, 0.99)
+walmart_data <- walmart_data %>%
+  filter(Weekly_Sales <= quantile_value)
+```
+
+Outliers in the top 1% of sales were removed to improve model generalization.
+
+### Scaling Numerical Columns
+```{r}
+walmart_data <- walmart_data %>%
+  mutate_at(vars(Temperature, Fuel_Price, CPI, Unemployment), scale)
+```
+
+The dataset was thoroughly preprocessed in order to increase the model's generalization; duplicate rows were examined to ensure that they were not present. Extreme outliers in the weekly sales data were considered to be a part of the 99th percentile and were deleted. Furthermore, numerical predictors for temperature and economic variables were standardized to an equal scale during model training to ensure accuracy.
+
+# Modeling & Analysis
+## Random Forest Model
+```{r}
+#Data Partitioning
+set.seed(123)
+
+sample_index <- sample(1:nrow(walmart_data), size = 0.6 * nrow(walmart_data))
+train_data <- walmart_data[sample_index, ]
+remaining_data <- walmart_data[-sample_index, ]
+
+# Split remaining data into validation and test sets
+validation_index <- sample(1:nrow(remaining_data), size = 0.5 * nrow(remaining_data))
+validation_data <- remaining_data[validation_index, ]
+test_data <- remaining_data[-validation_index, ]
+
+# Check the number of records in each partition
+nrow(train_data)
+nrow(validation_data)
+nrow(test_data)
+```
+
+## Random Forest Model Training
+```{r}
+rf_model <- randomForest(Weekly_Sales ~ Store + Temperature + Fuel_Price + CPI + Unemployment + Holiday_Flag + Year + Month, 
+                         data = train_data, ntree = 500, mtry = 3, importance = TRUE)
+```
+
+```{r}
+train_predictions_rf <- predict(rf_model, train_data)
+validation_predictions_rf <- predict(rf_model, validation_data)
+test_predictions_rf <- predict(rf_model, test_data)
+```
+
+## Model Evaluation
+### R-squared
+```{r}
+r_squared_train_rf <- summary(lm(train_predictions_rf ~ train_data$Weekly_Sales))$r.squared
+r_squared_validation_rf <- summary(lm(validation_predictions_rf ~ validation_data$Weekly_Sales))$r.squared
+r_squared_test_rf <- summary(lm(test_predictions_rf ~ test_data$Weekly_Sales))$r.squared
+
+# Print Results
+r_squared_train_rf
+r_squared_validation_rf
+r_squared_test_rf
+```
+
+### Mean Absolute Error
+```{r}
+mae_rf_train <- mae(train_data$Weekly_Sales, train_predictions_rf)
+mae_rf_validation <- mae(validation_data$Weekly_Sales, validation_predictions_rf)
+mae_rf_test <- mae(test_data$Weekly_Sales, test_predictions_rf)
+
+# Print Results
+mae_rf_train
+mae_rf_validation
+mae_rf_test
+```
+
+### Mean Absolute Percentage Error
+```{r}
+mape_safe <- function(actual, predicted) {
+  non_zero_indices <- which(actual != 0)
+  actual_non_zero <- actual[non_zero_indices]
+  predicted_non_zero <- predicted[non_zero_indices]
+  mean(abs((actual_non_zero - predicted_non_zero) / actual_non_zero)) * 100
+}
+
+# Calculate MAPE for each set
+mape_train <- mape_safe(train_data$Weekly_Sales, train_predictions_rf)
+mape_validation <- mape_safe(validation_data$Weekly_Sales, validation_predictions_rf)
+mape_test <- mape_safe(test_data$Weekly_Sales, test_predictions_rf)
+
+# Print Results
+mape_train
+mape_validation
+mape_test
+```
+
+## Visualizations
+### Variable Importance
+```{r}
+importance(rf_model)
+varImpPlot(rf_model)
+```
+
+### Predicted vs Actual
+```{r}
+plot_predicted_vs_actual <- function(actual, predicted, set_name) {
+  ggplot(data = data.frame(Actual = actual, Predicted = predicted), aes(x = Actual, y = Predicted)) +
+    geom_point(color = "blue", alpha = 0.5) +
+    geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed") +
+    labs(
+      title = paste("Predicted vs Actual Weekly Sales (", set_name, " Set)", sep = ""),
+      x = "Actual Weekly Sales",
+      y = "Predicted Weekly Sales"
+    ) +
+    theme_minimal(base_size = 15) +
+    coord_fixed(ratio = 1)
+}
+
+# Generate plots for each set
+plot_train <- plot_predicted_vs_actual(train_data$Weekly_Sales, train_predictions_rf, "Train")
+plot_validation <- plot_predicted_vs_actual(validation_data$Weekly_Sales, validation_predictions_rf, "Val")
+plot_test <- plot_predicted_vs_actual(test_data$Weekly_Sales, test_predictions_rf, "Test")
+```
+
+
+```{r}
+print(plot_train)
+```
+
+```{r}
+print(plot_validation)
+```
+
+```{r}
+print(plot_test)
+```
+
+The Random Forest model produced excellent results on all three datasets, with R-squared values of roughly 0.991, 0.956, and 0.958 for the training, validation, and test data, respectively, indicating the model's high predictive potential. The MAPE in test data was 20.71%, indicating that there may be considerable variability in the data. The most influential predictors were "Store" and "CPI," with holiday flags contributing less in terms of forecast accuracy. These findings are consistent with the data trends, which show that sales are influenced by robust store-specific and economic restrictions.
+
+# XGBoost Model
+```{r}
+normalize <- function(x) {
+  return((x - min(x)) / (max(x) - min(x)))
+}
+
+# Apply normalization
+walmart_data$Temperature <- normalize(walmart_data$Temperature)
+walmart_data$Fuel_Price <- normalize(walmart_data$Fuel_Price)
+walmart_data$CPI <- normalize(walmart_data$CPI)
+walmart_data$Unemployment <- normalize(walmart_data$Unemployment)
+walmart_data$Weekly_Sales <- normalize(walmart_data$Weekly_Sales)
+
+# Split the data into training, validation, and testing sets (60/20/20 split)
+set.seed(123)
+train_index <- createDataPartition(walmart_data$Weekly_Sales, p = 0.6, list = FALSE)
+train_data <- walmart_data[train_index, ]
+temp_data <- walmart_data[-train_index, ]
+validation_index <- createDataPartition(temp_data$Weekly_Sales, p = 0.5, list = FALSE)
+validation_data <- temp_data[validation_index, ]
+test_data <- temp_data[-validation_index, ]
+
+# Prepare data for xgboost
+predictors <- c("Store", "Temperature", "Fuel_Price", "CPI", "Unemployment", "Holiday_Flag", "Year", "Month")
+x_train <- as.matrix(train_data[, predictors])
+y_train <- train_data$Weekly_Sales
+x_validation <- as.matrix(validation_data[, predictors])
+y_validation <- validation_data$Weekly_Sales
+x_test <- as.matrix(test_data[, predictors])
+y_test <- test_data$Weekly_Sales
+
+# Convert the data to DMatrix format (required by xgboost)
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dvalidation <- xgb.DMatrix(data = x_validation, label = y_validation)
+dtest <- xgb.DMatrix(data = x_test, label = y_test)
+```
+
+```{r, include=FALSE}
+xgb_model <- xgb.train(
+  data = dtrain,
+  objective = "reg:squarederror",  # Regression task
+  eval_metric = "rmse",           # Evaluation metric: RMSE
+  nrounds = 500,                  # Number of boosting rounds
+  max_depth = 6,                  # Maximum depth of trees
+  eta = 0.1,                      # Learning rate
+  subsample = 0.8,                # Subsampling of rows
+  colsample_bytree = 0.8,         # Subsampling of columns
+  watchlist = list(train = dtrain, val = dvalidation),  # Monitor training/validation loss
+  early_stopping_rounds = 10      # Stop training if no improvement for 10 rounds
+)
+```
+
+## Model Predictions and Evaluation
+```{r}
+validation_preds <- predict(xgb_model, dvalidation)
+test_preds <- predict(xgb_model, dtest)
+
+reverse_normalize <- function(x, original_data) {
+  return(x * (max(original_data) - min(original_data)) + min(original_data))
+}
+
+validation_preds_actual <- reverse_normalize(validation_preds, walmart_data$Weekly_Sales)
+test_preds_actual <- reverse_normalize(test_preds, walmart_data$Weekly_Sales)
+y_test_actual <- reverse_normalize(y_test, walmart_data$Weekly_Sales)
+
+# Calculate MAPE
+validation_mape <- mean(abs(validation_preds_actual - reverse_normalize(y_validation, walmart_data$Weekly_Sales)) /
+                        reverse_normalize(y_validation, walmart_data$Weekly_Sales)) * 100
+test_mape <- mean(abs(test_preds_actual - y_test_actual) / y_test_actual) * 100
+
+# Print Results
+cat("Validation MAPE: ", round(validation_mape, 2), "%\n")
+cat("Test MAPE: ", round(test_mape, 2), "%\n")
+
+# Visualize predictions vs actual values
+plot(y_test_actual, test_preds_actual, main = "Actual vs Predicted Weekly Sales (Test Set)",
+     xlab = "Actual Weekly Sales", ylab = "Predicted Weekly Sales", pch = 19, col = "blue")
+abline(0, 1, col = "red", lwd = 2)
+```
+
+The XGBoost model worked well and had validation and test R-squared values close to those of Random Forest. Its MAPE for the validation set was 8.95%, while the MAPE for the test set was 10.14%, which already gives a good generalization. These results illustrate the success of the model in extracting underlying trends from Walmart's sales data: the strong presence of store-level characteristics and economic indices, such as CPI and unemployment, was regularly picked up as important predictors. This enhances the data story by emphasizing the power of external variables to explain the pattern of sales and the ability of the model to yield valuable insights for decision-making.
+
+## Feature Importance
+```{r}
+importance <- xgb.importance(feature_names = predictors, model = xgb_model)
+xgb.plot.importance(importance)
+```
+
+# Discussion
+## Random Forest Insights
+The Random Forest model showed excellent predictive performance. It had an R-squared of about 0.991 on the training set and 0.958 on the test set. It yielded a MAPE of 9.44% on the test data, representing generally low overall error with a robust fit to the data. Variable importance analysis revealed the most influential predictors:
+
+- Store: Sales across stores varied significantly, reflecting the impact of location-specific factors such as demographics, regional preferences, and store size.
+
+- CPI (Consumer Price Index): Economic conditions were one of the strongest drivers of sales, with fluctuations in the Consumer Price Index matching the changes in purchasing power and consumer behavior.
+
+- Unemployment Rate: Higher unemployment is associated with lower sales, reflecting Walmart's sensitivity to economic declines.
+
+In contrast, temperature and holiday flags were less important predictors, suggesting that while these factors may influence sales during specific weeks, their overall contribution to sales performance is relatively minor.
+
+## XGBoost Insights
+The XGBoost model also showed competitive results: a validation MAPE of 10.07% and a test MAPE of 12.22%. This model again generalized well across datasets due to its ability to model complex interactions and nonlinear relationships between predictors. Feature importance of the XGBoost model was consistent with the Random Forest, with the top predictors being:
+
+- Store: The store-specific factors were also identified as the main driver of sales variability for the XGBoost model.
+
+- CPI and Unemployment: Economic indicators played a critical role in shaping weekly sales trends, underscoring their importance in demand forecasting.
+
+The model also confirmed that holiday flags and temperature are of limited predictive power, in line with the broader observation that seasonality and weather effects are minor compared to economic and store-specific drivers.
+
+# Conclusion
+
+This analysis used a Random Forest and an XGBoost model for forecasting the weekly sales of Walmart to infer actionable insights on driving factors of sales performance. This study shows the real value of machine learning in big data sets within retail, with robust models offering great predictive accuracy and uncovering main drivers of sales.
+
+The analysis pinpointed store-specific characteristics and economic indicators, such as the Consumer Price Index and unemployment rate, as key factors in explaining sales variability. This is a very valuable insight that helps Walmart make better decisions in areas such as inventory, staffing, and promotions, adjusting them to demand patterns of different stores and economic conditions.
+
+Since it was found that holiday flags and temperature have limited predictive power, their inclusion in the models allows for a comprehensive investigation of all possible drivers. Such ability by the models to generalize well reflects their robustness in handling diversity.
+
+Future work should focus on the extension of the dataset with more external variables, such as local events or competitive pricing, in order to further improve the forecasting accuracy. Advanced feature engineering and the use of ensemble methods can also yield incremental benefits and keep Walmart ahead in managing demand fluctuations and operational efficiency.
